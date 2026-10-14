@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke-test:
+    name: Fresh Laravel app boots in the stack
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: starter
+
+      - name: Build the PHP image
+        run: docker build --target dev -t starter-php starter
+
+      - name: Create a fresh Laravel app with the same PHP
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e COMPOSER_HOME=/tmp/composer
+          -v "$PWD:/work" -w /work starter-php
+          composer create-project laravel/laravel app --prefer-dist --no-interaction
+
+      - name: Add the starter files
+        run: cp -r starter/Dockerfile starter/docker-compose.yml starter/.dockerignore starter/Makefile starter/docker app/
+
+      - name: Point Laravel at the MySQL container
+        working-directory: app
+        run: |
+          sed -i 's/^# *DB_/DB_/' .env
+          sed -i 's/^DB_CONNECTION=.*/DB_CONNECTION=mysql/; s/^DB_HOST=.*/DB_HOST=db/; s/^DB_PORT=.*/DB_PORT=3306/; s/^DB_DATABASE=.*/DB_DATABASE=laravel/; s/^DB_USERNAME=.*/DB_USERNAME=laravel/; s/^DB_PASSWORD=.*/DB_PASSWORD=secret/' .env
+          grep '^DB_' .env
+
+      - name: Start the stack
+        working-directory: app
+        run: docker compose up -d --build --wait
+
+      - name: Permissions and migrations
+        working-directory: app
+        run: |
+          docker compose exec -T app chown -R www-data:www-data storage bootstrap/cache
+          docker compose exec -T app php artisan migrate --force
+
+      - name: Home page answers 200 through Nginx
+        run: curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-all-errors -o /dev/null -w "%{http_code}\n" http://localhost:8080/
+
+      - name: .env is not reachable
+        run: test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/.env)" = "403"
+
+      - name: Production image builds
+        working-directory: app
+        run: docker build --target prod -t laravel-app:prod .
+
+      - name: Logs on failure
+        if: failure()
+        working-directory: app
+        run: docker compose logs
